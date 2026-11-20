@@ -139,3 +139,36 @@ second agent, and a person approving the large ones.
 |---|---|---|
 | Page | `app/support/page.tsx` | The "Refund Console" title and nothing else yet, linked from the header as Support |
 | Chat panel | `components/copper/ask-copper.tsx` | With the `docked` prop it starts open and the page beside it stays clickable. It is the same single agent and tools as on the home page |
+
+## Module 4: Refunds with a second agent and a person in the loop
+
+**Summary:** On the Support page, Copper hands refund requests to a separate
+Refund agent. The app's code decides each refund against an auto-refund limit
+set in the Refund Console: at or under it the money goes back on its own; over
+it, the refund waits until a person clicks Approve or Reject.
+
+| Piece | Where | What it does |
+|---|---|---|
+| Page | `app/support/page.tsx` | Renders the `RefundConsole` beside the docked chat |
+| Console | `components/copper/refund-console.tsx` | Holds the limit, each order's status and the approval queue; posts Approve/Reject outcomes into the chat |
+| Chat panel | `components/copper/ask-copper.tsx` | With `refunds`, sends the limit and statuses with each question, applies the decisions that come back, and shows console updates as Copper messages |
+| Rule and data | `lib/copper/refunds.ts` | `ORDERS` (Maya Reyes, prices from the catalog), `decideRefund()` (the limit check, in code) and `applyDecision()` |
+| Hand-off tool | `lib/copper/assistant/tools.ts` | `transfer_to_refund_agent`, only offered on the Support page |
+| Refund agent | `lib/copper/assistant/refund-agent.ts` | Its own instructions and tools: `get_orders`, `request_refund` (which calls `decideRefund`) |
+| AI calls | `{ module: 4, feature: "refund-agent" }` | One `callText` per hand-off (up to 4 steps), inside Copper's streamed call |
+
+**Data flow:** customer asks in the chat → Copper calls
+`transfer_to_refund_agent` → the Refund agent finds the order and calls
+`request_refund` → `decideRefund()` refunds it or marks it waiting → the
+console updates → for waiting refunds, a person clicks Approve or Reject → the
+console posts the outcome into the chat.
+
+**Decisions and trade-offs:** The model never decides the money: it only
+picks the order; code compares the amount to the limit and a person decides
+anything above it. Refund state lives in the browser (the console) and is sent
+with each question, so it works on Vercel without a database; it resets on
+reload, which is fine for a demo but a real app would store it server-side.
+
+**Risks and open questions:** The client sends the statuses, so a real app
+must check them on the server with authentication. The Refund agent may ask a
+follow-up question when a request matches several orders.

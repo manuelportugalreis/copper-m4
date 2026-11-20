@@ -7,15 +7,21 @@
 import { stepCountIs } from "ai";
 import { callStream, THOUGHT_SUMMARIES } from "@/lib/ai/call";
 import { createLive, type Live } from "@/lib/ai/live";
-import { COPPER_INSTRUCTIONS } from "@/lib/copper/assistant/instructions";
+import {
+  COPPER_INSTRUCTIONS,
+  REFUND_HANDOFF_INSTRUCTIONS,
+} from "@/lib/copper/assistant/instructions";
 import type { Progress, ToolStep } from "@/lib/copper/assistant/progress";
-import { copperTools } from "@/lib/copper/assistant/tools";
+import { copperTools, refundHandoffTool } from "@/lib/copper/assistant/tools";
+import type { RefundDesk } from "@/lib/copper/refunds";
 
 export type ChatMessage = { role: "user" | "assistant"; content: string };
 
 export type AskCopperRequest = {
   messages: ChatMessage[];
   useTools: boolean;
+  /** On the Support page: the auto-refund limit and order statuses. */
+  refundDesk?: RefundDesk;
 };
 
 export type AskCopperResult = { progress: Live<Progress> };
@@ -28,6 +34,7 @@ const SORRY = "Sorry, something went wrong on my end. Please try again.";
 export async function askCopper({
   messages,
   useTools,
+  refundDesk,
 }: AskCopperRequest): Promise<AskCopperResult> {
   const { live, update, done } = createLive<Progress>();
   const progress: Progress = { steps: [], reply: "", status: "working" };
@@ -50,8 +57,14 @@ export async function askCopper({
       messages,
       providerOptions: THOUGHT_SUMMARIES,
       ...(useTools && {
-        instructions: COPPER_INSTRUCTIONS,
-        tools: copperTools,
+        instructions: refundDesk
+          ? `${COPPER_INSTRUCTIONS}
+
+${REFUND_HANDOFF_INSTRUCTIONS}`
+          : COPPER_INSTRUCTIONS,
+        tools: refundDesk
+          ? { ...copperTools, ...refundHandoffTool(refundDesk) }
+          : copperTools,
         stopWhen: stepCountIs(MAX_STEPS),
       }),
     },

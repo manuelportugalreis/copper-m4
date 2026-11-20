@@ -15,6 +15,8 @@ import {
 import { DOCUMENTS, pageUrl } from "@/lib/copper/documents";
 import { readInventory } from "@/lib/copper/inventory";
 import { PASSAGES } from "@/lib/copper/passages";
+import { runRefundAgent } from "@/lib/copper/assistant/refund-agent";
+import type { RefundDesk } from "@/lib/copper/refunds";
 
 export type ProductList = {
   products: {
@@ -271,3 +273,26 @@ export const copperTools = {
     execute: async ({ query }) => searchDocs(query),
   }),
 };
+
+/**
+ * Module 4: the hand-off. Copper gives refund requests to the Refund agent (a
+ * second agent with its own tools) and passes its answer back. Only offered on
+ * the Support page, where the Refund Console sends the limit and statuses.
+ */
+export function refundHandoffTool(desk: RefundDesk) {
+  return {
+    transfer_to_refund_agent: tool({
+      description:
+        "Hands a refund request to the Refund agent, which looks up the customer's orders and asks the app to refund one. Use it for every request to get money back.",
+      inputSchema: z.object({
+        request: z
+          .string()
+          .min(3)
+          .describe(
+            "What the customer wants refunded, in her words, with any order number, product or amount she gave.",
+          ),
+      }),
+      execute: async ({ request }) => runRefundAgent(request, desk),
+    }),
+  };
+}

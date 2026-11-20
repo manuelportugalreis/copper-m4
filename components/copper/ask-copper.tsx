@@ -35,6 +35,7 @@ import {
   TOOL_LABELS,
 } from "@/lib/copper/assistant/progress";
 import { formatUsd, getPlans, getProducts } from "@/lib/copper/catalog";
+import type { RefundDecision, RefundDesk } from "@/lib/copper/refunds";
 import { cn } from "@/lib/utils";
 
 const STARTERS = [
@@ -43,7 +44,37 @@ const STARTERS = [
   "Is Copper Plus cheaper monthly or yearly?",
 ];
 
-type Turn = { question: string; progress: Progress };
+/** A notice turn has no question: an update posted by the Refund Console. */
+type Turn = { question: string; progress: Progress; notice?: boolean };
+
+/** A message from the Refund Console to the customer (after Approve/Reject). */
+export type ChatNotice = { id: string; text: string };
+
+/** Connects the chat to the Refund Console on the Support page. */
+export type RefundBridge = {
+  desk: RefundDesk;
+  /** Called with every refund the app decided during an answer. */
+  onDecisions: (decisions: RefundDecision[]) => void;
+  /** Updates the console posts into the chat, oldest first. */
+  notices: ChatNotice[];
+};
+
+const REFUND_STARTERS = [
+  "I'd like a refund for my Copper Plus monthly plan.",
+  "I want my money back for my Copper Notes.",
+  "Please refund my Copper Home, order #1004.",
+];
+
+/** Every refund decided inside an answer's hand-offs to the Refund agent. */
+function decisionsOf(progress: Progress): RefundDecision[] {
+  return progress.steps.flatMap((step) =>
+    step.type === "tool" &&
+    step.name === "transfer_to_refund_agent" &&
+    step.state === "done"
+      ? ((step.output as { decisions?: RefundDecision[] })?.decisions ?? [])
+      : [],
+  );
+}
 type Chats = { tools: Turn[]; noTools: Turn[] };
 
 const WORKING: Progress = { steps: [], reply: "", status: "working" };
@@ -51,8 +82,11 @@ const WORKING: Progress = { steps: [], reply: "", status: "working" };
 export function AskCopper({
   aiConfigured,
   docked = false,
+  refunds,
 }: {
   aiConfigured: boolean;
+  /** On the Support page: lets Copper hand refunds to the Refund agent. */
+  refunds?: RefundBridge;
   /** Stays open beside the page, which remains clickable (the Support page). */
   docked?: boolean;
 }) {
@@ -61,6 +95,29 @@ export function AskCopper({
   const [chats, setChats] = useState<Chats>({ tools: [], noTools: [] });
   const [draft, setDraft] = useState("");
   const body = useRef<HTMLDivElement>(null);
+  const shownNotices = useRef(new Set<string>());
+  const starters = refunds ? REFUND_STARTERS : STARTERS;
+  const notices = refunds?.notices;
+
+  // Post each new Refund Console update into the chat, as Copper.
+  useEffect(() => {
+    const fresh = (notices ?? []).filter(
+      (n) => !shownNotices.current.has(n.id),
+    );
+    if (fresh.length === 0) return;
+    fresh.forEach((n) => shownNotices.current.add(n.id));
+    setChats((all) => ({
+      ...all,
+      tools: [
+        ...all.tools,
+        ...fresh.map((n) => ({
+          question: "",
+          notice: true,
+          progress: { steps: [], reply: n.text, status: "done" as const },
+        })),
+      ],
+    }));
+  }, [notices]);
 
   const key = useTools ? "tools" : "noTools";
   const turns = chats[key];
@@ -93,11 +150,23 @@ export function AskCopper({
     const chat = key;
     const index = turns.length;
     // Only finished turns go to the model: questions and Copper's replies.
+    // A console update joins Copper's previous reply, so roles still alternate.
     const messages: ChatMessage[] = [
-      ...turns.flatMap(({ question, progress }): ChatMessage[] => [
-        { role: "user", content: question },
-        { role: "assistant", content: progress.reply },
-      ]),
+      ...turns.reduce<ChatMessage[]>((all, turn) => {
+        const last = all.at(-1);
+        if (turn.notice && last?.role === "assistant")
+          return [
+            ...all.slice(0, -1),
+            { ...last, content: `${last.content}\n\n${turn.progress.reply}` },
+          ];
+        return [
+          ...all,
+          ...(turn.notice
+            ? []
+            : [{ role: "user" as const, content: turn.question }]),
+          { role: "assistant" as const, content: turn.progress.reply },
+        ];
+      }, []),
       { role: "user", content: question },
     ];
     const setProgress = (progress: Progress) =>
@@ -115,8 +184,15 @@ export function AskCopper({
       const { progress } = await askCopper({
         messages,
         useTools: chat === "tools",
+        ...(refunds && chat === "tools" && { refundDesk: refunds.desk }),
       });
-      for await (const update of readLive(progress)) setProgress(update);
+      let latest: Progress | null = null;
+      for await (const update of readLive(progress)) {
+        latest = update;
+        setProgress(update);
+      }
+      const decisions = latest ? decisionsOf(latest) : [];
+      if (refunds && decisions.length) refunds.onDecisions(decisions);
     } catch {
       setProgress({
         steps: [],
@@ -157,7 +233,9 @@ export function AskCopper({
                   Ask Copper
                 </SheetTitle>
                 <SheetDescription className="text-xs text-white/70">
-                  Prices, totals and stock, checked with tools.
+                  {refunds
+                    ? "Copper answers; the Refund agent handles refunds."
+                    : "Prices, totals and stock, checked with tools."}
                 </SheetDescription>
               </div>
               <SheetClose asChild>
@@ -194,23 +272,43 @@ export function AskCopper({
                 ref={body}
                 className="bg-secondary flex-1 space-y-6 overflow-y-auto px-4 py-5"
               >
-                {turns.map((turn, i) => (
-                  <div key={i} className="space-y-4">
-                    <p className="bg-primary text-primary-foreground ml-auto w-fit max-w-[85%] rounded-2xl rounded-br-sm px-4 py-2">
-                      {turn.question}
-                    </p>
-                    <Answer progress={turn.progress} useTools={useTools} />
-                  </div>
-                ))}
+                {turns.map((turn, i) =>
+                  turn.notice ? (
+                    <div
+                      key={i}
+                      data-testid="refund-notice"
+                      className="bg-card ml-2 rounded-2xl rounded-tl-sm border p-4 shadow-xs"
+                    >
+                      <p className="text-primary mb-1 text-xs font-bold">
+                        Copper · update from the Refund team
+                      </p>
+                      <p className="text-sm whitespace-pre-wrap">
+                        {turn.progress.reply}
+                      </p>
+                    </div>
+                  ) : (
+                    <div key={i} className="space-y-4">
+                      <p className="bg-primary text-primary-foreground ml-auto w-fit max-w-[85%] rounded-2xl rounded-br-sm px-4 py-2">
+                        {turn.question}
+                      </p>
+                      <Answer
+                        progress={turn.progress}
+                        useTools={useTools}
+                        offersRefunds={Boolean(refunds)}
+                      />
+                    </div>
+                  ),
+                )}
                 {!busy && (
                   <div className="space-y-2">
                     {turns.length === 0 && (
                       <p className="text-muted-foreground text-sm">
-                        Hi, I&apos;m Copper! Ask me about prices, totals or
-                        stock. Try one of these:
+                        {refunds
+                          ? "Hi, I'm Copper! Ask me anything, or ask for a refund. Try one of these:"
+                          : "Hi, I'm Copper! Ask me about prices, totals or stock. Try one of these:"}
                       </p>
                     )}
-                    {STARTERS.map((starter) => (
+                    {starters.map((starter) => (
                       <button
                         key={starter}
                         type="button"
@@ -234,7 +332,9 @@ export function AskCopper({
                   aria-label="Your question"
                   value={draft}
                   onChange={(event) => setDraft(event.target.value)}
-                  placeholder="Ask about prices or stock…"
+                  placeholder={
+                    refunds ? "Ask for a refund…" : "Ask about prices or stock…"
+                  }
                   className="bg-background focus-visible:ring-ring h-10 flex-1 rounded-full border px-4 text-sm outline-none focus-visible:ring-2"
                 />
                 <Button
@@ -263,9 +363,11 @@ export function AskCopper({
 function Answer({
   progress,
   useTools,
+  offersRefunds = false,
 }: {
   progress: Progress;
   useTools: boolean;
+  offersRefunds?: boolean;
 }) {
   const { steps, reply, status } = progress;
   const used = new Set(
@@ -293,24 +395,28 @@ function Answer({
           }
         >
           <div className="flex flex-wrap gap-1.5">
-            {Object.keys(TOOL_LABELS).map((name) => (
-              <span
-                key={name}
-                className={cn(
-                  "rounded-md px-2 py-0.5 font-mono text-xs",
-                  !useTools &&
-                    "text-muted-foreground bg-background line-through",
-                  useTools &&
-                    used.has(name) &&
-                    "bg-accent font-bold text-white",
-                  useTools &&
-                    !used.has(name) &&
-                    "bg-background text-muted-foreground",
-                )}
-              >
-                {name}
-              </span>
-            ))}
+            {Object.keys(TOOL_LABELS)
+              .filter(
+                (name) => name !== "transfer_to_refund_agent" || offersRefunds,
+              )
+              .map((name) => (
+                <span
+                  key={name}
+                  className={cn(
+                    "rounded-md px-2 py-0.5 font-mono text-xs",
+                    !useTools &&
+                      "text-muted-foreground bg-background line-through",
+                    useTools &&
+                      used.has(name) &&
+                      "bg-accent font-bold text-white",
+                    useTools &&
+                      !used.has(name) &&
+                      "bg-background text-muted-foreground",
+                  )}
+                >
+                  {name}
+                </span>
+              ))}
           </div>
           {!useTools && (
             <p className="text-muted-foreground mt-1.5 text-xs">
@@ -656,6 +762,8 @@ function ToolOutput({ name, output }: { name: string; output: any }) {
         ))}
       </ol>
     );
+  if (name === "transfer_to_refund_agent" && output?.steps)
+    return <RefundHandoff output={output} />;
   // A tool without its own layout yet: show what came back as plain text.
   return (
     <pre className="max-h-48 overflow-auto text-xs whitespace-pre-wrap">
@@ -704,5 +812,58 @@ function Pill({
     >
       {children}
     </span>
+  );
+}
+
+const OUTCOME_LABELS: Record<string, string> = {
+  refunded: "Refunded automatically",
+  pending_approval: "Waiting for approval",
+  already_refunded: "Already refunded",
+  already_pending: "Already waiting",
+  already_rejected: "Already declined",
+  not_found: "Order not found",
+};
+
+/** The Refund agent's own steps inside the hand-off, then what it answered. */
+function RefundHandoff({
+  output,
+}: {
+  output: {
+    reply: string;
+    decisions: RefundDecision[];
+    steps: { tool: string; input: unknown }[];
+  };
+}) {
+  return (
+    <div className="space-y-2 text-xs">
+      <p className="text-muted-foreground">The Refund agent used:</p>
+      <ol className="space-y-1">
+        {output.steps.map((step, i) => (
+          <li key={i} className="font-mono">
+            {i + 1}. {step.tool}(
+            {step.tool === "request_refund"
+              ? `#${(step.input as { orderId?: string })?.orderId ?? "?"}`
+              : ""}
+            )
+          </li>
+        ))}
+      </ol>
+      {output.decisions.map((d, i) => (
+        <div
+          key={i}
+          data-testid="refund-decision"
+          className="flex items-center justify-between gap-2 rounded-md border px-2 py-1"
+        >
+          <span>
+            #{d.orderId} {d.item} · {formatUsd(d.amountUsd)} (limit{" "}
+            {formatUsd(d.limitUsd)})
+          </span>
+          <span className="font-semibold">
+            {OUTCOME_LABELS[d.outcome] ?? d.outcome}
+          </span>
+        </div>
+      ))}
+      <p className="border-l-2 pl-2 italic">{output.reply}</p>
+    </div>
   );
 }
