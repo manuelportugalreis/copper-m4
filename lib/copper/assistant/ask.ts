@@ -129,7 +129,12 @@ ${REFUND_HANDOFF_INSTRUCTIONS}`
       }
       progress.status = "done";
       if (!progress.reply.trim()) progress.reply = SORRY;
-    } catch {
+    } catch (error) {
+      // Server log only: the reason the model call failed (never the key).
+      console.error(
+        "[ask-copper] failed:",
+        error instanceof Error ? error.message : String(error),
+      );
       progress.status = "error";
       if (!progress.reply.trim()) progress.reply = SORRY;
     }
